@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/rdarius/go-http-server/internal/dataMaps"
 	"github.com/rdarius/go-http-server/internal/database"
 	"github.com/rdarius/go-http-server/internal/httpResponse"
 	"log"
@@ -75,6 +76,62 @@ func fileServerHandler() http.Handler {
 	return http.StripPrefix("/app", fileServer)
 }
 
+func getAllChirpsHandler(cfg *apiConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		chirps, err := cfg.db.GetAllChirps(context.Background())
+		if err != nil {
+			httpResponse.SomethingWentWrong(w)
+		}
+
+		data := make([]dataMaps.Chirp, 0)
+		for _, chirp := range chirps {
+			data = append(data, dataMaps.Chirp{
+				ID:        chirp.ID,
+				CreatedAt: chirp.CreatedAt,
+				UpdatedAt: chirp.UpdatedAt,
+				Body:      chirp.Body,
+				UserID:    chirp.UserID,
+			})
+		}
+
+		jsonData, err := json.Marshal(data)
+		if err != nil {
+			httpResponse.SomethingWentWrong(w)
+		}
+		httpResponse.PlainTextHandler(w, http.StatusOK, string(jsonData))
+	}
+}
+
+func getChirpByIDHandler(cfg *apiConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		uuid, err := uuid.Parse(r.PathValue("chirpID"))
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusBadRequest, `{"error": "InvalidChirpID"}`)
+		}
+
+		chirp, err := cfg.db.GetChirpByID(context.Background(), uuid)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusNotFound, `{"error": "ChirpNotFound"}`)
+		}
+
+		data := dataMaps.Chirp{
+			ID:        chirp.ID,
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+			Body:      chirp.Body,
+			UserID:    chirp.UserID,
+		}
+
+		jsonData, err := json.Marshal(data)
+		if err != nil {
+			httpResponse.SomethingWentWrong(w)
+		}
+		httpResponse.PlainTextHandler(w, http.StatusOK, string(jsonData))
+	}
+}
+
 func postChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
@@ -104,14 +161,20 @@ func postChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 			return
 		}
 
-		jsonData := fmt.Sprintf(`{
-			"id": "%s",
-			"created_at": "%s",
-			"updated_at": "%s",
-			"body": "%s",
-			"user_id": "%s"
-			}`, newChirp.ID, newChirp.CreatedAt, newChirp.UpdatedAt, newChirp.Body, newChirp.UserID)
-		httpResponse.JSONHandler(w, http.StatusCreated, jsonData)
+		chirpJSON := dataMaps.Chirp{
+			ID:        newChirp.ID,
+			CreatedAt: newChirp.CreatedAt,
+			UpdatedAt: newChirp.UpdatedAt,
+			Body:      newChirp.Body,
+			UserID:    newChirp.UserID,
+		}
+
+		jsonData, err := json.Marshal(chirpJSON)
+		if err != nil {
+			httpResponse.SomethingWentWrong(w)
+			return
+		}
+		httpResponse.JSONHandler(w, http.StatusCreated, string(jsonData))
 	}
 }
 
@@ -134,13 +197,18 @@ func postUsersHandler(cfg *apiConfig) http.HandlerFunc {
 			return
 		}
 
-		jsonData := fmt.Sprintf(`{
-			"id": "%s",
-			"created_at": "%s",
-			"updated_at": "%s",
-			"email": "%s"
-			}`, usr.ID, usr.CreatedAt, usr.UpdatedAt, usr.Email)
-		httpResponse.JSONHandler(w, http.StatusCreated, jsonData)
+		userJSON := dataMaps.User{
+			ID:        usr.ID,
+			CreatedAt: usr.CreatedAt,
+			UpdatedAt: usr.UpdatedAt,
+			Email:     usr.Email,
+		}
+
+		jsonData, err := json.Marshal(userJSON)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+		}
+		httpResponse.JSONHandler(w, http.StatusCreated, string(jsonData))
 	}
 }
 
@@ -185,6 +253,8 @@ func main() {
 	mux.HandleFunc("POST /api/reset", resetMetricsHandler(apiCfg))
 	mux.HandleFunc("POST /api/users", postUsersHandler(apiCfg))
 	mux.HandleFunc("POST /api/chirps", postChirpsHandler(apiCfg))
+	mux.HandleFunc("GET /api/chirps", getAllChirpsHandler(apiCfg))
+	mux.HandleFunc("GET /api/chirps/{chirpID}", getChirpByIDHandler(apiCfg))
 
 	mux.HandleFunc("GET /admin/metrics", adminMetricsHandler(apiCfg))
 	mux.HandleFunc("POST /admin/reset", resetMetricsHandler(apiCfg))
