@@ -146,12 +146,18 @@ func postChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
 		}
 
-		uuid, err := auth.ValidateJWT(token, cfg.secret)
+		userId, err := auth.ValidateJWT(token, cfg.secret)
 
 		params := parameters{}
 		err = json.NewDecoder(r.Body).Decode(&params)
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusBadRequest, `{"error": "Failed to parse request body"}`)
+			return
+		}
+
+		_, err = cfg.db.GetUserByID(context.Background(), userId)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
 			return
 		}
 
@@ -163,7 +169,7 @@ func postChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 
 		newChirp, err := cfg.db.CreateChirp(context.Background(), database.CreateChirpParams{
 			Body:   chirp,
-			UserID: uuid,
+			UserID: userId,
 		})
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
@@ -186,12 +192,71 @@ func postChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 		httpResponse.JSONHandler(w, http.StatusCreated, string(jsonData))
 	}
 }
+
+func refreshTokenHandler(cfg *apiConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+			return
+		}
+
+		find, err := cfg.db.GetRefreshTokenByToken(context.Background(), token)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+			return
+		}
+
+		_, err = cfg.db.GetUserByID(context.Background(), find.UserID)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+			return
+		}
+
+		if find.RevokedAt.Valid {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+			return
+		}
+
+		newToken, err := auth.MakeJWT(find.UserID, cfg.secret, time.Duration(3600)*time.Second)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
+		}
+
+		httpResponse.JSONHandler(w, http.StatusOK, fmt.Sprintf(`{"token": "%s"}`, newToken))
+	}
+}
+
+func revokeRefreshTokenHandler(cfg *apiConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+			return
+		}
+
+		find, err := cfg.db.GetRefreshTokenByToken(context.Background(), token)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+			return
+		}
+
+		err = cfg.db.RevokeRefreshTokenByToken(context.Background(), find.Token)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
+		}
+
+		httpResponse.JSONHandler(w, http.StatusNoContent, "")
+	}
+}
+
 func loginHandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Email            string `json:"email"`
-			Password         string `json:"password"`
-			ExpiresInSeconds int    `json:"expires_in_seconds"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
 		}
 
 		params := parameters{}
@@ -213,10 +278,6 @@ func loginHandler(cfg *apiConfig) http.HandlerFunc {
 			return
 		}
 
-		if params.ExpiresInSeconds == 0 || params.ExpiresInSeconds > 3600 {
-			params.ExpiresInSeconds = 3600
-		}
-
 		userJSON := dataMaps.UserWithToken{
 			ID:        user.ID,
 			CreatedAt: user.CreatedAt,
@@ -224,11 +285,27 @@ func loginHandler(cfg *apiConfig) http.HandlerFunc {
 			Email:     user.Email,
 		}
 
-		expiresIn := time.Duration(params.ExpiresInSeconds) * time.Second
+		expiresIn := time.Duration(3600) * time.Second
 
 		userJSON.Token, err = auth.MakeJWT(user.ID, cfg.secret, expiresIn)
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusBadRequest, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
+		}
+
+		userJSON.RefreshToken, err = auth.MakeRefreshToken()
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
+		}
+
+		_, err = cfg.db.CreateRefreshToken(context.Background(), database.CreateRefreshTokenParams{
+			Token:     userJSON.RefreshToken,
+			UserID:    userJSON.ID,
+			ExpiresAt: time.Now().UTC().Add(time.Duration(60*24*3600) * time.Second),
+		})
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
 			return
 		}
 
@@ -327,6 +404,8 @@ func main() {
 	mux.HandleFunc("POST /api/reset", resetMetricsHandler(apiCfg))
 	mux.HandleFunc("POST /api/users", postUsersHandler(apiCfg))
 	mux.HandleFunc("POST /api/login", loginHandler(apiCfg))
+	mux.HandleFunc("POST /api/refresh", refreshTokenHandler(apiCfg))
+	mux.HandleFunc("POST /api/revoke", revokeRefreshTokenHandler(apiCfg))
 	mux.HandleFunc("POST /api/chirps", postChirpsHandler(apiCfg))
 	mux.HandleFunc("GET /api/chirps", getAllChirpsHandler(apiCfg))
 	mux.HandleFunc("GET /api/chirps/{chirpID}", getChirpByIDHandler(apiCfg))
