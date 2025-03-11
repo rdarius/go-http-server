@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/rdarius/go-http-server/internal/database"
@@ -74,6 +75,46 @@ func fileServerHandler() http.Handler {
 	return http.StripPrefix("/app", fileServer)
 }
 
+func postChirpsHandler(cfg *apiConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Body   string    `json:"body"`
+			UserID uuid.UUID `json:"user_id"`
+		}
+
+		params := parameters{}
+		err := json.NewDecoder(r.Body).Decode(&params)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusBadRequest, `{"error": "Failed to parse request body"}`)
+			return
+		}
+
+		chirp, err := validateChirp(params.Body)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusBadRequest, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
+		}
+
+		newChirp, err := cfg.db.CreateChirp(context.Background(), database.CreateChirpParams{
+			Body:   chirp,
+			UserID: params.UserID,
+		})
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
+		}
+
+		jsonData := fmt.Sprintf(`{
+			"id": "%s",
+			"created_at": "%s",
+			"updated_at": "%s",
+			"body": "%s",
+			"user_id": "%s"
+			}`, newChirp.ID, newChirp.CreatedAt, newChirp.UpdatedAt, newChirp.Body, newChirp.UserID)
+		httpResponse.JSONHandler(w, http.StatusCreated, jsonData)
+	}
+}
+
 func postUsersHandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
@@ -103,36 +144,19 @@ func postUsersHandler(cfg *apiConfig) http.HandlerFunc {
 	}
 }
 
-func validateChirpHandler(w http.ResponseWriter, r *http.Request) {
-	type parameters struct {
-		Body string `json:"body"`
-	}
-
+func validateChirp(chirp string) (string, error) {
 	profaneWords := []string{"kerfuffle", "sharbert", "fornax"}
 
-	decoder := json.NewDecoder(r.Body)
-	params := parameters{}
-	err := decoder.Decode(&params)
-	if err != nil {
-		httpResponse.SomethingWentWrong(w)
-		return
+	if len(chirp) > 140 {
+		return "", fmt.Errorf("chirp is too long")
 	}
-
-	if len(params.Body) > 140 {
-		httpResponse.JSONHandler(w, http.StatusBadRequest, `{"error": "Chirp is too long"}`)
-		return
-	}
-
-	chirp := params.Body
 
 	for _, word := range profaneWords {
-		// Use word boundaries (\b) to match whole words and ignore punctuation
 		re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(word) + `\b`)
 		chirp = re.ReplaceAllString(chirp, "****")
 	}
 
-	httpResponse.JSONHandler(w, http.StatusOK, fmt.Sprintf(`{"cleaned_body": "%s"}`, chirp))
-	return
+	return chirp, nil
 }
 
 func main() {
@@ -159,8 +183,8 @@ func main() {
 	mux.HandleFunc("GET /api/healthz", readinessHandler)
 	mux.HandleFunc("GET /api/metrics", metricsHandler(apiCfg))
 	mux.HandleFunc("POST /api/reset", resetMetricsHandler(apiCfg))
-	mux.HandleFunc("POST /api/validate_chirp", validateChirpHandler)
 	mux.HandleFunc("POST /api/users", postUsersHandler(apiCfg))
+	mux.HandleFunc("POST /api/chirps", postChirpsHandler(apiCfg))
 
 	mux.HandleFunc("GET /admin/metrics", adminMetricsHandler(apiCfg))
 	mux.HandleFunc("POST /admin/reset", resetMetricsHandler(apiCfg))
