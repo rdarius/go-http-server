@@ -85,6 +85,7 @@ func getAllChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 		chirps, err := cfg.db.GetAllChirps(context.Background())
 		if err != nil {
 			httpResponse.SomethingWentWrong(w)
+			return
 		}
 
 		data := make([]dataMaps.Chirp, 0)
@@ -112,11 +113,13 @@ func getChirpByIDHandler(cfg *apiConfig) http.HandlerFunc {
 		chirpID, err := uuid.Parse(r.PathValue("chirpID"))
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusBadRequest, `{"error": "InvalidChirpID"}`)
+			return
 		}
 
 		chirp, err := cfg.db.GetChirpByID(context.Background(), chirpID)
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusNotFound, `{"error": "ChirpNotFound"}`)
+			return
 		}
 
 		data := dataMaps.Chirp{
@@ -130,8 +133,70 @@ func getChirpByIDHandler(cfg *apiConfig) http.HandlerFunc {
 		jsonData, err := json.Marshal(data)
 		if err != nil {
 			httpResponse.SomethingWentWrong(w)
+			return
 		}
 		httpResponse.PlainTextHandler(w, http.StatusOK, string(jsonData))
+	}
+}
+
+func updateUserDatahandler(cfg *apiConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Password string `json:"password"`
+			Email    string `json:"email"`
+		}
+
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+			return
+		}
+
+		userId, err := auth.ValidateJWT(token, cfg.secret)
+
+		_, err = cfg.db.GetUserByID(context.Background(), userId)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+			return
+		}
+
+		params := parameters{}
+		err = json.NewDecoder(r.Body).Decode(&params)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusBadRequest, `{"error": "Failed to parse request body"}`)
+			return
+		}
+
+		hashedPassword, err := auth.HashPassword(params.Password)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, `{"error": "Failed to hash password"}`)
+			return
+		}
+
+		user, err := cfg.db.UpdateUserEmailAndPassword(context.Background(), database.UpdateUserEmailAndPasswordParams{
+			Email:          params.Email,
+			HashedPassword: hashedPassword,
+			ID:             userId,
+		})
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
+		}
+
+		userJSON := dataMaps.User{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+		}
+
+		jsonData, err := json.Marshal(userJSON)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
+		}
+		httpResponse.JSONHandler(w, http.StatusOK, string(jsonData))
+
 	}
 }
 
@@ -144,6 +209,7 @@ func postChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 		token, err := auth.GetBearerToken(r.Header)
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+			return
 		}
 
 		userId, err := auth.ValidateJWT(token, cfg.secret)
@@ -335,6 +401,7 @@ func postUsersHandler(cfg *apiConfig) http.HandlerFunc {
 		hash, err := auth.HashPassword(params.Password)
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
 		}
 
 		usr, err := cfg.db.CreateUser(context.Background(), database.CreateUserParams{
@@ -357,6 +424,7 @@ func postUsersHandler(cfg *apiConfig) http.HandlerFunc {
 		jsonData, err := json.Marshal(userJSON)
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
 		}
 		httpResponse.JSONHandler(w, http.StatusCreated, string(jsonData))
 	}
@@ -409,6 +477,7 @@ func main() {
 	mux.HandleFunc("POST /api/chirps", postChirpsHandler(apiCfg))
 	mux.HandleFunc("GET /api/chirps", getAllChirpsHandler(apiCfg))
 	mux.HandleFunc("GET /api/chirps/{chirpID}", getChirpByIDHandler(apiCfg))
+	mux.HandleFunc("PUT /api/users", updateUserDatahandler(apiCfg))
 
 	mux.HandleFunc("GET /admin/metrics", adminMetricsHandler(apiCfg))
 	mux.HandleFunc("POST /admin/reset", resetMetricsHandler(apiCfg))
