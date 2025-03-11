@@ -17,12 +17,14 @@ import (
 	"os"
 	"regexp"
 	"sync/atomic"
+	"time"
 )
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             database.Queries
 	platform       string
+	secret         string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -136,12 +138,18 @@ func getChirpByIDHandler(cfg *apiConfig) http.HandlerFunc {
 func postChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Body   string    `json:"body"`
-			UserID uuid.UUID `json:"user_id"`
+			Body string `json:"body"`
 		}
 
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+		}
+
+		uuid, err := auth.ValidateJWT(token, cfg.secret)
+
 		params := parameters{}
-		err := json.NewDecoder(r.Body).Decode(&params)
+		err = json.NewDecoder(r.Body).Decode(&params)
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusBadRequest, `{"error": "Failed to parse request body"}`)
 			return
@@ -155,7 +163,7 @@ func postChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 
 		newChirp, err := cfg.db.CreateChirp(context.Background(), database.CreateChirpParams{
 			Body:   chirp,
-			UserID: params.UserID,
+			UserID: uuid,
 		})
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
@@ -181,8 +189,9 @@ func postChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 func loginHandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Email    string `json:"email"`
-			Password string `json:"password"`
+			Email            string `json:"email"`
+			Password         string `json:"password"`
+			ExpiresInSeconds int    `json:"expires_in_seconds"`
 		}
 
 		params := parameters{}
@@ -204,16 +213,29 @@ func loginHandler(cfg *apiConfig) http.HandlerFunc {
 			return
 		}
 
-		userJSON := dataMaps.User{
+		if params.ExpiresInSeconds == 0 || params.ExpiresInSeconds > 3600 {
+			params.ExpiresInSeconds = 3600
+		}
+
+		userJSON := dataMaps.UserWithToken{
 			ID:        user.ID,
 			CreatedAt: user.CreatedAt,
 			UpdatedAt: user.UpdatedAt,
 			Email:     user.Email,
 		}
 
+		expiresIn := time.Duration(params.ExpiresInSeconds) * time.Second
+
+		userJSON.Token, err = auth.MakeJWT(user.ID, cfg.secret, expiresIn)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusBadRequest, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
+		}
+
 		jsonData, err := json.Marshal(userJSON)
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+			return
 		}
 		httpResponse.JSONHandler(w, http.StatusOK, string(jsonData))
 	}
@@ -288,6 +310,7 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 
 	apiCfg.platform = os.Getenv("PLATFORM")
+	apiCfg.secret = os.Getenv("SECRET")
 
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
