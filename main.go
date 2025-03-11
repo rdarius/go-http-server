@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/rdarius/go-http-server/internal/database"
+	"github.com/rdarius/go-http-server/internal/httpResponse"
 	"log"
 	"net/http"
 	"os"
@@ -17,6 +19,7 @@ import (
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             database.Queries
+	platform       string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -27,53 +30,77 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 }
 
 func readinessHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	httpResponse.PlainTextHandler(w, http.StatusOK, "OK")
 }
 
 func metricsHandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
 		hits := cfg.fileserverHits.Load()
-		w.Write([]byte(fmt.Sprintf("Hits: %d", hits)))
+		httpResponse.PlainTextHandler(w, http.StatusOK, fmt.Sprintf("Hits: %d", hits))
 	}
 }
 
 func adminMetricsHandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
 		hits := cfg.fileserverHits.Load()
-		w.Write([]byte(fmt.Sprintf(`<html>
+		httpResponse.HTMLHandler(w, http.StatusOK, fmt.Sprintf(`<html>
   <body>
     <h1>Welcome, Chirpy Admin</h1>
     <p>Chirpy has been visited %d times!</p>
   </body>
-</html>`, hits)))
+</html>`, hits))
 	}
 }
 func resetMetricsHandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+
+		if cfg.platform != "dev" {
+			httpResponse.JSONHandler(w, http.StatusForbidden, `{"error": "Forbidden!"}`)
+			return
+		}
+
+		err := cfg.db.DeleteAllUser(context.Background())
+		if err != nil {
+			httpResponse.SomethingWentWrong(w)
+			return
+		}
 		cfg.fileserverHits.Store(0)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Metrics Reset"))
-	}
-}
-func adminResetMetricsHandler(cfg *apiConfig) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		cfg.fileserverHits.Store(0)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Metrics Reset"))
+		httpResponse.PlainTextHandler(w, http.StatusOK, "Metrics Reset")
 	}
 }
 
 func fileServerHandler() http.Handler {
 	fileServer := http.FileServer(http.Dir("./public"))
 	return http.StripPrefix("/app", fileServer)
+}
+
+func postUsersHandler(cfg *apiConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Email string `json:"email"`
+		}
+
+		params := parameters{}
+		err := json.NewDecoder(r.Body).Decode(&params)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusBadRequest, `{"error": "Failed to parse request body"}`)
+			return
+		}
+
+		usr, err := cfg.db.CreateUser(context.Background(), params.Email)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "Failed to create user", "message": "%s"}`, err.Error()))
+			return
+		}
+
+		jsonData := fmt.Sprintf(`{
+			"id": "%s",
+			"created_at": "%s",
+			"updated_at": "%s",
+			"email": "%s"
+			}`, usr.ID, usr.CreatedAt, usr.UpdatedAt, usr.Email)
+		httpResponse.JSONHandler(w, http.StatusCreated, jsonData)
+	}
 }
 
 func validateChirpHandler(w http.ResponseWriter, r *http.Request) {
@@ -87,16 +114,12 @@ func validateChirpHandler(w http.ResponseWriter, r *http.Request) {
 	params := parameters{}
 	err := decoder.Decode(&params)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"error": "Something went wrong"}`))
+		httpResponse.SomethingWentWrong(w)
 		return
 	}
 
 	if len(params.Body) > 140 {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "Chirp is too long"}`))
+		httpResponse.JSONHandler(w, http.StatusBadRequest, `{"error": "Chirp is too long"}`)
 		return
 	}
 
@@ -108,9 +131,7 @@ func validateChirpHandler(w http.ResponseWriter, r *http.Request) {
 		chirp = re.ReplaceAllString(chirp, "****")
 	}
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf(`{"cleaned_body": "%s"}`, chirp)))
+	httpResponse.JSONHandler(w, http.StatusOK, fmt.Sprintf(`{"cleaned_body": "%s"}`, chirp))
 	return
 }
 
@@ -119,15 +140,16 @@ func main() {
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
+	apiCfg := &apiConfig{}
 
 	dbURL := os.Getenv("DB_URL")
+
+	apiCfg.platform = os.Getenv("PLATFORM")
 
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	apiCfg := &apiConfig{}
 
 	dbQueries := database.New(db)
 	apiCfg.db = *dbQueries
@@ -138,9 +160,10 @@ func main() {
 	mux.HandleFunc("GET /api/metrics", metricsHandler(apiCfg))
 	mux.HandleFunc("POST /api/reset", resetMetricsHandler(apiCfg))
 	mux.HandleFunc("POST /api/validate_chirp", validateChirpHandler)
+	mux.HandleFunc("POST /api/users", postUsersHandler(apiCfg))
 
 	mux.HandleFunc("GET /admin/metrics", adminMetricsHandler(apiCfg))
-	mux.HandleFunc("POST /admin/reset", adminResetMetricsHandler(apiCfg))
+	mux.HandleFunc("POST /admin/reset", resetMetricsHandler(apiCfg))
 
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(fileServerHandler()))
 
