@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/rdarius/go-http-server/internal/auth"
 	"github.com/rdarius/go-http-server/internal/dataMaps"
 	"github.com/rdarius/go-http-server/internal/database"
 	"github.com/rdarius/go-http-server/internal/httpResponse"
@@ -177,11 +178,11 @@ func postChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 		httpResponse.JSONHandler(w, http.StatusCreated, string(jsonData))
 	}
 }
-
-func postUsersHandler(cfg *apiConfig) http.HandlerFunc {
+func loginHandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Email string `json:"email"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
 		}
 
 		params := parameters{}
@@ -191,7 +192,57 @@ func postUsersHandler(cfg *apiConfig) http.HandlerFunc {
 			return
 		}
 
-		usr, err := cfg.db.CreateUser(context.Background(), params.Email)
+		user, err := cfg.db.GetUserByEmail(context.Background(), params.Email)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusNotFound, `{"error": "UserNotFound"}`)
+			return
+		}
+
+		err = auth.CheckPasswordHash(params.Password, user.HashedPassword)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Incorrect email or password"}`)
+			return
+		}
+
+		userJSON := dataMaps.User{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+		}
+
+		jsonData, err := json.Marshal(userJSON)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+		}
+		httpResponse.JSONHandler(w, http.StatusOK, string(jsonData))
+	}
+}
+
+func postUsersHandler(cfg *apiConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+
+		params := parameters{}
+		err := json.NewDecoder(r.Body).Decode(&params)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusBadRequest, `{"error": "Failed to parse request body"}`)
+			return
+		}
+
+		hash, err := auth.HashPassword(params.Password)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "%s"}`, err.Error()))
+		}
+
+		usr, err := cfg.db.CreateUser(context.Background(), database.CreateUserParams{
+			Email:          params.Email,
+			HashedPassword: hash,
+		})
+
 		if err != nil {
 			httpResponse.JSONHandler(w, http.StatusInternalServerError, fmt.Sprintf(`{"error": "Failed to create user", "message": "%s"}`, err.Error()))
 			return
@@ -252,6 +303,7 @@ func main() {
 	mux.HandleFunc("GET /api/metrics", metricsHandler(apiCfg))
 	mux.HandleFunc("POST /api/reset", resetMetricsHandler(apiCfg))
 	mux.HandleFunc("POST /api/users", postUsersHandler(apiCfg))
+	mux.HandleFunc("POST /api/login", loginHandler(apiCfg))
 	mux.HandleFunc("POST /api/chirps", postChirpsHandler(apiCfg))
 	mux.HandleFunc("GET /api/chirps", getAllChirpsHandler(apiCfg))
 	mux.HandleFunc("GET /api/chirps/{chirpID}", getChirpByIDHandler(apiCfg))
