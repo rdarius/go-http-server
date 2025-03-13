@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"sync/atomic"
 	"time"
 )
@@ -84,6 +85,9 @@ func getAllChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		q := r.URL.Query().Get("author_id")
+		sort := r.URL.Query().Get("sort")
+
+		fmt.Println(sort)
 
 		var chirps []database.Chirp
 		var err error
@@ -116,6 +120,18 @@ func getAllChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 				UpdatedAt: chirp.UpdatedAt,
 				Body:      chirp.Body,
 				UserID:    chirp.UserID,
+			})
+		}
+
+		if sort == "desc" {
+			slices.SortFunc(data, func(a, b dataMaps.Chirp) int {
+				if b.CreatedAt.After(a.CreatedAt) {
+					return 1
+				}
+				if b.CreatedAt.Before(a.CreatedAt) {
+					return -1
+				}
+				return 0
 			})
 		}
 
