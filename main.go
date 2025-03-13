@@ -25,6 +25,7 @@ type apiConfig struct {
 	db             database.Queries
 	platform       string
 	secret         string
+	polkaKey       string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -82,10 +83,29 @@ func fileServerHandler() http.Handler {
 func getAllChirpsHandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		chirps, err := cfg.db.GetAllChirps(context.Background())
-		if err != nil {
-			httpResponse.SomethingWentWrong(w)
-			return
+		q := r.URL.Query().Get("author_id")
+
+		var chirps []database.Chirp
+		var err error
+		var id uuid.UUID
+
+		if len(q) == 0 {
+			chirps, err = cfg.db.GetAllChirps(context.Background())
+			if err != nil {
+				httpResponse.SomethingWentWrong(w)
+				return
+			}
+		} else {
+			id, err = uuid.Parse(q)
+			if err != nil {
+				httpResponse.SomethingWentWrong(w)
+				return
+			}
+			chirps, err = cfg.db.GetChirpsByUserID(context.Background(), id)
+			if err != nil {
+				httpResponse.SomethingWentWrong(w)
+				return
+			}
 		}
 
 		data := make([]dataMaps.Chirp, 0)
@@ -182,6 +202,59 @@ func deleteChirpByIDHandler(cfg *apiConfig) http.HandlerFunc {
 		httpResponse.PlainTextHandler(w, http.StatusNoContent, "")
 	}
 }
+func polkaWebhookHandler(cfg *apiConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		key, err := auth.GetAPIKey(r.Header)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+			return
+		}
+
+		if key != cfg.polkaKey {
+			httpResponse.JSONHandler(w, http.StatusUnauthorized, `{"error": "Unauthorized"}`)
+			return
+		}
+
+		type polkaWebhook struct {
+			Event string `json:"event"`
+			Data  struct {
+				UserId string `json:"user_id"`
+			} `json:"data"`
+		}
+
+		data := polkaWebhook{}
+		err = json.NewDecoder(r.Body).Decode(&data)
+		if err != nil {
+			httpResponse.SomethingWentWrong(w)
+			return
+		}
+
+		if data.Event != "user.upgraded" {
+			httpResponse.JSONHandler(w, http.StatusNoContent, "")
+			return
+		}
+
+		userID, err := uuid.Parse(data.Data.UserId)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusBadRequest, `{"error": "InvalidUserID"}`)
+			return
+		}
+
+		_, err = cfg.db.GetUserByID(context.Background(), userID)
+		if err != nil {
+			httpResponse.JSONHandler(w, http.StatusNotFound, `{"error": "UserNotFound"}`)
+			return
+		}
+
+		err = cfg.db.UpgradeUserToChirpyRed(context.Background(), userID)
+		if err != nil {
+			httpResponse.SomethingWentWrong(w)
+			return
+		}
+		httpResponse.PlainTextHandler(w, http.StatusNoContent, "")
+	}
+}
 
 func updateUserDatahandler(cfg *apiConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -228,10 +301,11 @@ func updateUserDatahandler(cfg *apiConfig) http.HandlerFunc {
 		}
 
 		userJSON := dataMaps.User{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
+			ID:          user.ID,
+			CreatedAt:   user.CreatedAt,
+			UpdatedAt:   user.UpdatedAt,
+			Email:       user.Email,
+			IsChirpyRed: user.IsChirpyRed,
 		}
 
 		jsonData, err := json.Marshal(userJSON)
@@ -389,10 +463,11 @@ func loginHandler(cfg *apiConfig) http.HandlerFunc {
 		}
 
 		userJSON := dataMaps.UserWithToken{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
+			ID:          user.ID,
+			CreatedAt:   user.CreatedAt,
+			UpdatedAt:   user.UpdatedAt,
+			Email:       user.Email,
+			IsChirpyRed: user.IsChirpyRed,
 		}
 
 		expiresIn := time.Duration(3600) * time.Second
@@ -459,10 +534,11 @@ func postUsersHandler(cfg *apiConfig) http.HandlerFunc {
 		}
 
 		userJSON := dataMaps.User{
-			ID:        usr.ID,
-			CreatedAt: usr.CreatedAt,
-			UpdatedAt: usr.UpdatedAt,
-			Email:     usr.Email,
+			ID:          usr.ID,
+			CreatedAt:   usr.CreatedAt,
+			UpdatedAt:   usr.UpdatedAt,
+			Email:       usr.Email,
+			IsChirpyRed: usr.IsChirpyRed,
 		}
 
 		jsonData, err := json.Marshal(userJSON)
@@ -500,6 +576,7 @@ func main() {
 
 	apiCfg.platform = os.Getenv("PLATFORM")
 	apiCfg.secret = os.Getenv("SECRET")
+	apiCfg.polkaKey = os.Getenv("POLKA_KEY")
 
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
@@ -522,6 +599,7 @@ func main() {
 	mux.HandleFunc("GET /api/chirps", getAllChirpsHandler(apiCfg))
 	mux.HandleFunc("GET /api/chirps/{chirpID}", getChirpByIDHandler(apiCfg))
 	mux.HandleFunc("DELETE /api/chirps/{chirpID}", deleteChirpByIDHandler(apiCfg))
+	mux.HandleFunc("POST /api/polka/webhooks", polkaWebhookHandler(apiCfg))
 	mux.HandleFunc("PUT /api/users", updateUserDatahandler(apiCfg))
 
 	mux.HandleFunc("GET /admin/metrics", adminMetricsHandler(apiCfg))
